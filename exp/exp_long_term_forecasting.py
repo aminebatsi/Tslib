@@ -15,6 +15,52 @@ from utils.augmentation import run_augmentation, run_augmentation_single
 warnings.filterwarnings('ignore')
 
 
+class BitcoinQuantLoss(nn.Module):
+    def __init__(self,
+                 lambda_reg=1.0,
+                 lambda_dir=0.5,
+                 lambda_pnl=1.0,
+                 lambda_risk=0.2,
+                 lambda_tail=0.3,
+                 delta=1.0,
+                 k=5.0):
+        super().__init__()
+
+        self.lambda_reg = lambda_reg
+        self.lambda_dir = lambda_dir
+        self.lambda_pnl = lambda_pnl
+        self.lambda_risk = lambda_risk
+        self.lambda_tail = lambda_tail
+
+        self.huber = nn.HuberLoss(delta=delta)
+        self.k = k
+
+    def quantile_loss(self, y_pred, y_true, q=0.9):
+        err = y_true - y_pred
+        return torch.mean(torch.max(q * err, (q - 1) * err))
+
+    def forward(self, y_pred, y_true):
+
+        loss_reg = self.huber(y_pred, y_true)
+        loss_dir = -torch.mean(torch.sign(y_true) * y_pred)
+
+        position = torch.tanh(self.k * y_pred)
+        pnl = position * y_true
+        loss_pnl = -torch.mean(pnl)
+
+        loss_risk = torch.var(pnl)
+        loss_tail = self.quantile_loss(y_pred, y_true, q=0.9)
+
+        total_loss = (
+            self.lambda_reg * loss_reg +
+            self.lambda_dir * loss_dir +
+            self.lambda_pnl * loss_pnl +
+            self.lambda_risk * loss_risk +
+            self.lambda_tail * loss_tail
+        )
+
+        return total_loss
+
 class Exp_Long_Term_Forecast(Exp_Basic):
     def __init__(self, args):
         super(Exp_Long_Term_Forecast, self).__init__(args)
@@ -35,7 +81,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         return model_optim
 
     def _select_criterion(self):
-        criterion = nn.MSELoss()
+        criterion = BitcoinQuantLoss()
         return criterion
  
 
