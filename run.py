@@ -156,6 +156,37 @@ if __name__ == '__main__':
     parser.add_argument('--top_p', type=float, default=0.5, help='Dynamic Routing in MoE')
     parser.add_argument('--pos', type=int, choices=[0, 1], default=1, help='Positional Embedding. Set pos to 0 or 1')
 
+    # ---- VAMPM ----
+    parser.add_argument('--patch_lens', type=int, nargs='+', default=[8, 16, 32],
+                        help='multi-scale patch lengths, e.g. --patch_lens 8 16 32')
+
+    parser.add_argument('--patch_stride_mode', type=str, default='half',
+                        choices=['half', 'fixed'],
+                        help="stride computation: 'half' => patch_len//2, 'fixed' => use --patch_stride")
+
+    parser.add_argument('--patch_stride', type=int, default=None,
+                        help='used only when patch_stride_mode=fixed')
+
+    parser.add_argument('--patch_padding_mode', type=str, default='stride',
+                        choices=['stride', 'fixed'],
+                        help="padding computation: 'stride' => padding=stride, 'fixed' => use --patch_padding")
+
+    parser.add_argument('--patch_padding', type=int, default=None,
+                        help='used only when patch_padding_mode=fixed')
+
+    parser.add_argument('--patch_num_bias', type=int, default=2,
+                        help="bias used in patch num formula: int((seq_len - p)/s + bias). Your code uses +2 by default.")
+
+    # ---- Scale gating  ----
+    parser.add_argument('--use_scale_gating', type=int, default=1,
+                        help='1: enable VolatilityAwareScaleGatingSE per scale, 0: disable')
+
+    parser.add_argument('--se_reduction', type=int, default=4,
+                        help='reduction ratio inside VolatilityAwareScaleGatingSE')
+
+    parser.add_argument('--se_dropout', type=float, default=0.1,
+                        help='dropout inside VolatilityAwareScaleGatingSE gate MLP')
+    
     args = parser.parse_args()
     if torch.cuda.is_available() and args.use_gpu:
         args.device = torch.device('cuda:{}'.format(args.gpu))

@@ -15,52 +15,391 @@ from utils.augmentation import run_augmentation, run_augmentation_single
 warnings.filterwarnings('ignore')
 
 
-class BitcoinQuantLoss(nn.Module):
-    def __init__(self,
-                 lambda_reg=1.0,
-                 lambda_dir=0.5,
-                 lambda_pnl=1.0,
-                 lambda_risk=0.2,
-                 lambda_tail=0.3,
-                 delta=1.0,
-                 k=5.0):
+import torch.nn.functional as F
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+def _pearson_corr(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """Differentiable Pearson correlation over the last dimension."""
+    x_c = x - x.mean(dim=-1, keepdim=True)
+    y_c = y - y.mean(dim=-1, keepdim=True)
+    num = (x_c * y_c).sum(dim=-1)
+    denom = x_c.norm(dim=-1) * y_c.norm(dim=-1) + eps
+    return num / denom                      # shape: (...,) in [-1, 1]
+ 
+ 
+def _rolling_realized_vol(
+    x: torch.Tensor, window: int, eps: float = 1e-8
+) -> torch.Tensor:
+    """
+    Rolling realised volatility: RV_t = sqrt(mean(r_{t-w:t}^2)).
+    Returns a tensor of same length as input (first window-1 steps use
+    expanding window for stability).
+    x shape: (T,) or (B, T).
+    """
+    flat = x.shape[-1] == x.numel()         # single series
+    if x.dim() == 1:
+        x = x.unsqueeze(0)                  # (1, T)
+ 
+    B, T = x.shape
+    rv = torch.zeros_like(x)
+    for t in range(T):
+        start = max(0, t - window + 1)
+        rv[:, t] = x[:, start:t + 1].pow(2).mean(dim=-1).sqrt()
+ 
+    return rv.squeeze(0) if flat else rv    # restore original shape
+ 
+ 
+def _standardized_moment(x: torch.Tensor, k: int, eps: float = 1e-8) -> torch.Tensor:
+    """k-th standardized moment (skewness k=3, kurtosis k=4)."""
+    x_c = x - x.mean(dim=-1, keepdim=True)
+    std = x_c.std(dim=-1, keepdim=True) + eps
+    return ((x_c / std) ** k).mean(dim=-1)
+ 
+ 
+def _cumulative_drawdown_weights(
+    target: torch.Tensor, eps: float = 1e-8
+) -> torch.Tensor:
+    """
+    Computes a weight per timestep proportional to how deep the
+    cumulative loss run is at that point.
+ 
+    A 'loss run' is a streak of consecutive negative returns.  The weight
+    at step t = (length of current negative streak)^0.5, normalised so
+    mean = 1.  This up-weights errors that occur during sustained sell-offs
+    without completely ignoring quiet or positive-return periods.
+ 
+    Returns weights with same shape as target, mean ≈ 1.
+    """
+    neg = (target < 0).float()              # 1 where negative return
+    T   = target.shape[-1]
+    streak = torch.zeros_like(target)
+    for t in range(T):
+        if t == 0:
+            streak[..., t] = neg[..., t]
+        else:
+            streak[..., t] = (streak[..., t - 1] + 1) * neg[..., t]
+ 
+    weights = (streak + 1.0).sqrt()         # +1 so non-drawdown steps have weight 1
+    weights = weights / (weights.mean(dim=-1, keepdim=True) + eps)
+    return weights
+ 
+ 
+# ─────────────────────────────────────────────────────────────────────────────
+# Main loss class
+# ─────────────────────────────────────────────────────────────────────────────
+ 
+class QuantNativeLoss(nn.Module):
+    """
+    Ultimate quant-native loss for log-return prediction.
+ 
+    Args:
+        w_ic         : weight for IC (correlation) loss.           Default 0.40
+        w_vol        : weight for log-vol matching loss.           Default 0.30
+        w_norm       : weight for normalised-residual loss.        Default 0.20
+        w_moment     : weight for moment-matching loss.            Default 0.07
+        w_drawdown   : weight for drawdown-weighted residual.      Default 0.03
+        rv_window    : rolling window size for realised vol.       Default 20
+        norm_window  : rolling window for local vol normalisation. Default 10
+        moment_alpha : relative weight of skewness vs variance
+                       inside the moment term (0=var only,1=skew only).
+                                                                   Default 0.5
+        eps          : numerical stability constant.
+    """
+ 
+    def __init__(
+        self,
+        w_ic: float        = 0.40,
+        w_vol: float       = 0.30,
+        w_norm: float      = 0.20,
+        w_moment: float    = 0.07,
+        w_drawdown: float  = 0.03,
+        rv_window: int     = 20,
+        norm_window: int   = 10,
+        moment_alpha: float = 0.5,
+        eps: float         = 1e-8,
+    ):
         super().__init__()
-
-        self.lambda_reg = lambda_reg
-        self.lambda_dir = lambda_dir
-        self.lambda_pnl = lambda_pnl
-        self.lambda_risk = lambda_risk
-        self.lambda_tail = lambda_tail
-
-        self.huber = nn.HuberLoss(delta=delta)
-        self.k = k
-
-    def quantile_loss(self, y_pred, y_true, q=0.9):
-        err = y_true - y_pred
-        return torch.mean(torch.max(q * err, (q - 1) * err))
-
-    def forward(self, y_pred, y_true):
-
-        loss_reg = self.huber(y_pred, y_true)
-        loss_dir = -torch.mean(torch.sign(y_true) * y_pred)
-
-        position = torch.tanh(self.k * y_pred)
-        pnl = position * y_true
-        loss_pnl = -torch.mean(pnl)
-
-        loss_risk = torch.var(pnl)
-        loss_tail = self.quantile_loss(y_pred, y_true, q=0.9)
-
-        total_loss = (
-            self.lambda_reg * loss_reg +
-            self.lambda_dir * loss_dir +
-            self.lambda_pnl * loss_pnl +
-            self.lambda_risk * loss_risk +
-            self.lambda_tail * loss_tail
+        total = w_ic + w_vol + w_norm + w_moment + w_drawdown
+        self.w_ic       = w_ic       / total
+        self.w_vol      = w_vol      / total
+        self.w_norm     = w_norm     / total
+        self.w_moment   = w_moment   / total
+        self.w_drawdown = w_drawdown / total
+ 
+        self.rv_window    = rv_window
+        self.norm_window  = norm_window
+        self.moment_alpha = moment_alpha
+        self.eps          = eps
+ 
+    # ── Component 1 ── IC Loss ──────────────────────────────────────────────
+    def _ic_loss(
+        self, pred: torch.Tensor, target: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        L_IC = 1 - Pearson_corr(pred, target)
+ 
+        Range: [0, 2].  0 = perfect positive correlation.
+        Gradient: directly increases the linear relationship between
+        pred and target.  This is the differentiable analogue of the
+        Information Coefficient used in systematic fund performance
+        attribution.
+ 
+        Key insight: MSE minimises E[(p-t)²], which is minimised by
+        predicting the conditional mean (≈ 0 for zero-mean returns).
+        Correlation maximisation is minimised by pred = 0 *only* if
+        target = 0, which is never true — so this term always pushes
+        the model toward tracking the actual return path.
+        """
+        corr = _pearson_corr(pred, target, self.eps)
+        return (1.0 - corr).mean()
+ 
+    # ── Component 2 ── Log-Vol Matching ─────────────────────────────────────
+    def _log_vol_matching(
+        self, pred: torch.Tensor, target: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        L_vol = MSE( log(RV_pred + eps), log(RV_true + eps) )
+ 
+        RV_t = sqrt( mean( r_{t-w:t}^2 ) )   — rolling realised vol
+ 
+        Log-space comparison is critical:
+          • RV typically spans 0.001 to 0.05 for daily crypto returns.
+          • In linear space, MSE is dominated by large-vol periods.
+          • In log space, relative errors are penalised equally at all
+            volatility levels — exactly what we want.
+ 
+        This is the PRIMARY fix for the flat orange line.  If pred has
+        near-zero amplitude (RV ≈ 0.001) and target has RV ≈ 0.02,
+        log(0.001) vs log(0.02) is a large penalty that MSE would barely
+        notice.
+        """
+        rv_pred   = _rolling_realized_vol(pred,   self.rv_window, self.eps)
+        rv_target = _rolling_realized_vol(target, self.rv_window, self.eps)
+ 
+        log_rv_pred   = torch.log(rv_pred   + self.eps)
+        log_rv_target = torch.log(rv_target + self.eps)
+ 
+        return F.mse_loss(log_rv_pred, log_rv_target)
+ 
+    # ── Component 3 ── Normalised Residual Loss ──────────────────────────────
+    def _normalised_residual_loss(
+        self, pred: torch.Tensor, target: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        L_norm = mean( (pred - target)² / sigma_t² )
+ 
+        sigma_t = rolling_std(target, window)   — local volatility estimate
+ 
+        This is the log-likelihood of a locally-Gaussian model:
+          r_t ~ N(pred_t, sigma_t²)
+          -log p(r_t) ∝ (r_t - pred_t)² / sigma_t²
+ 
+        Effect: a 2% error on a 0.5%-vol day is penalised 16× more than
+        the same error on a 2%-vol day.  The model cannot reduce loss by
+        predicting the mean — it must track actual returns proportionally
+        to local vol.
+ 
+        Unlike plain MSE, this enforces *equal risk contribution* from
+        every timestep, matching how quants think about diversified signal.
+        """
+        T = target.shape[-1]
+        sigma = torch.zeros_like(target)
+        for t in range(T):
+            start = max(0, t - self.norm_window + 1)
+            window_data = target[..., start:t + 1]
+            sigma[..., t] = window_data.std(dim=-1) + self.eps
+ 
+        normalised_sq_err = ((pred - target) / sigma) ** 2
+        return normalised_sq_err.mean()
+ 
+    # ── Component 4 ── Moment Matching ──────────────────────────────────────
+    def _moment_matching_loss(
+        self, pred: torch.Tensor, target: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        L_moment = (1-alpha) * L_var + alpha * L_skew
+ 
+        L_var  = ( (std_pred - std_target) / std_target )²
+        L_skew = ( skew_pred - skew_target )²
+ 
+        BTC log-returns are:
+          • Leptokurtic (fat tails): excess kurtosis ≈ 5–15
+          • Negatively skewed:       skewness ≈ -0.5 to -1.5
+ 
+        MSE will produce predictions with near-Gaussian, near-zero-mean
+        characteristics.  This term penalises the prediction distribution
+        directly — the model must not only track the path but reproduce
+        the statistical texture of BTC returns.
+ 
+        Variance term is normalised by target variance so it is scale-free.
+        """
+        std_pred   = pred.std(dim=-1)   + self.eps
+        std_target = target.std(dim=-1) + self.eps
+ 
+        # Relative variance mismatch
+        l_var = ((std_pred - std_target) / std_target).pow(2).mean()
+ 
+        # Skewness mismatch
+        skew_pred   = _standardized_moment(pred,   3, self.eps)
+        skew_target = _standardized_moment(target, 3, self.eps)
+        l_skew = (skew_pred - skew_target).pow(2).mean()
+ 
+        return (1.0 - self.moment_alpha) * l_var + self.moment_alpha * l_skew
+ 
+    # ── Component 5 ── Drawdown-Weighted Residual ───────────────────────────
+    def _drawdown_weighted_loss(
+        self, pred: torch.Tensor, target: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        L_dd = mean( w_t * (pred - target)² )
+ 
+        w_t = sqrt(consecutive_negative_streak_length_at_t)  normalised.
+ 
+        Intuition from risk management: sustained drawdown periods are
+        when prediction quality matters most for portfolio protection.
+        A model that is accurate during rallies but badly wrong during
+        a 5-day sell-off is dangerous.  This term ensures the gradient
+        specifically cares about those windows.
+        """
+        weights = _cumulative_drawdown_weights(target, self.eps)
+        return (weights * (pred - target).pow(2)).mean()
+ 
+    # ── Forward ─────────────────────────────────────────────────────────────
+    def forward(
+        self, pred: torch.Tensor, target: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Args:
+            pred   : predicted log-returns  shape (batch, seq_len) or (seq_len,)
+            target : true log-returns       same shape
+ 
+        Returns:
+            Scalar loss.
+        """
+        assert pred.shape == target.shape, (
+            f"Shape mismatch: pred {pred.shape} vs target {target.shape}"
         )
+        # pred, target: (batch, seq_len, num_vars) or (batch, seq_len)
+        if pred.dim() == 3:
+            B, T, V = pred.shape
+            # Treat each variable independently: flatten batch & var
+            pred   = pred.permute(0,2,1).reshape(B*V, T)
+            target = target.permute(0,2,1).reshape(B*V, T)
+        elif pred.dim() == 2:
+            pass  # already (batch, seq_len)
+        elif pred.dim() == 1:
+            pred   = pred.unsqueeze(0)
+            target = target.unsqueeze(0)
+        else:
+            raise ValueError(f"Unsupported shape: {pred.shape}")
 
-        return total_loss
-
+ 
+        l_ic   = self._ic_loss(pred, target)
+        l_vol  = self._log_vol_matching(pred, target)
+        l_norm = self._normalised_residual_loss(pred, target)
+        l_mom  = self._moment_matching_loss(pred, target)
+        l_dd   = self._drawdown_weighted_loss(pred, target)
+ 
+        return (
+            self.w_ic   * l_ic
+            + self.w_vol  * l_vol
+            + self.w_norm * l_norm
+            + self.w_mom  * l_mom
+            + self.w_drawdown * l_dd
+        )
+ 
+    @property
+    def w_mom(self):
+        return self.w_moment
+ 
+    def component_losses(
+        self, pred: torch.Tensor, target: torch.Tensor
+    ) -> dict:
+        """
+        Returns all raw component losses for W&B / TensorBoard logging.
+ 
+        Recommended usage:
+            loss = criterion(pred, target)
+            loss.backward()
+            optimizer.step()
+            # log every N steps:
+            comps = criterion.component_losses(pred.detach(), target)
+            wandb.log(comps)
+        """
+        if pred.dim() == 1:
+            pred   = pred.unsqueeze(0)
+            target = target.unsqueeze(0)
+ 
+        return {
+            "loss/ic":       self._ic_loss(pred, target).item(),
+            "loss/log_vol":  self._log_vol_matching(pred, target).item(),
+            "loss/norm_res": self._normalised_residual_loss(pred, target).item(),
+            "loss/moment":   self._moment_matching_loss(pred, target).item(),
+            "loss/drawdown": self._drawdown_weighted_loss(pred, target).item(),
+        }
+ 
+    def ic_score(
+        self, pred: torch.Tensor, target: torch.Tensor
+    ) -> float:
+        """
+        Returns the raw IC (Pearson corr) as a diagnostic metric.
+        IC > 0.05 is considered meaningful in systematic trading.
+        IC > 0.10 is considered good.
+        """
+        if pred.dim() == 1:
+            pred   = pred.unsqueeze(0)
+            target = target.unsqueeze(0)
+        return _pearson_corr(pred, target, self.eps).mean().item()
+ 
+ 
+# ─────────────────────────────────────────────────────────────────────────────
+# Training recipe — important scheduler tip
+# ─────────────────────────────────────────────────────────────────────────────
+ 
+class WarmStartQuantLoss(nn.Module):
+    """
+    Two-phase loss scheduler.
+ 
+    Phase 1 (epochs 0 → warmup_epochs):
+        Pure MSELoss — lets the model learn the rough scale and
+        mean of returns before introducing the harder objectives.
+ 
+    Phase 2 (epochs > warmup_epochs):
+        QuantNativeLoss — full quant-native objectives take over.
+ 
+    Why this matters:
+        The IC loss gradient is noisy when the model output is random
+        (early training).  Starting with MSE warm-up stabilises the
+        hidden states before switching to the correlation objective.
+    """
+ 
+    def __init__(self, warmup_epochs: int = 5, **quant_kwargs):
+        super().__init__()
+        self.warmup_epochs = warmup_epochs
+        self.mse           = nn.MSELoss()
+        self.quant         = QuantNativeLoss(**quant_kwargs)
+        self._epoch        = 0
+ 
+    def step_epoch(self):
+        """Call once per epoch: criterion.step_epoch()"""
+        self._epoch += 1
+ 
+    @property
+    def phase(self) -> str:
+        return "warmup" if self._epoch < self.warmup_epochs else "quant"
+ 
+    def forward(
+        self, pred: torch.Tensor, target: torch.Tensor
+    ) -> torch.Tensor:
+        if self._epoch < self.warmup_epochs:
+            return self.mse(pred, target)
+        return self.quant(pred, target)
+    
 class Exp_Long_Term_Forecast(Exp_Basic):
     def __init__(self, args):
         super(Exp_Long_Term_Forecast, self).__init__(args)
@@ -81,9 +420,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         return model_optim
 
     def _select_criterion(self):
-        criterion = BitcoinQuantLoss()
-        return criterion
- 
+        return QuantNativeLoss()
 
     def vali(self, vali_data, vali_loader, criterion):
         total_loss = []
