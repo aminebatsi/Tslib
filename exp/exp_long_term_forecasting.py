@@ -12,12 +12,19 @@ import numpy as np
 from utils.dtw_metric import dtw, accelerated_dtw
 from utils.augmentation import run_augmentation, run_augmentation_single
 
-# Import the finance-aware loss from the model module.
-# Adjust the import path to wherever Model/ReturnQuantFinanceLoss live in your project.
-from models.VAMPM import ReturnQuantFinanceLoss
-
 warnings.filterwarnings('ignore')
 
+class SharpeLoss(nn.Module):
+    """Directly maximizes Sharpe ratio of predicted signals"""
+    def __init__(self, eps=1e-6):
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, pred, target):
+        # pred = predicted signal/position, target = actual returns
+        pnl = pred * target                          # strategy P&L per step
+        sharpe = pnl.mean() / (pnl.std() + self.eps)
+        return -sharpe                               # negative because we minimize
 
 class Exp_Long_Term_Forecast(Exp_Basic):
     def __init__(self, args):
@@ -25,9 +32,6 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
     def _build_model(self):
         model = self.model_dict[self.args.model](self.args).float()
-
-        # Enable auxiliary outputs so the finance loss receives the full dict.
-        model.return_aux_outputs = True
 
         if self.args.use_multi_gpu and self.args.use_gpu:
             model = nn.DataParallel(model, device_ids=self.args.device_ids)
@@ -42,56 +46,10 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         return model_optim
 
     def _select_criterion(self):
-        """
-        Use the finance-aware loss when the new model is active,
-        otherwise fall back to MSE for any other model in model_dict.
-        """
-        if self.args.model in ('VAMPM',):   # <-- add model name(s) here
-            criterion = ReturnQuantFinanceLoss(
-                quantiles=getattr(self.args, 'quantiles', (0.1, 0.5, 0.9)),
-                lambda_return=getattr(self.args, 'lambda_return', 1.0),
-                lambda_direction=getattr(self.args, 'lambda_direction', 0.3),
-                lambda_vol=getattr(self.args, 'lambda_vol', 0.2),
-                lambda_quantile=getattr(self.args, 'lambda_quantile', 0.3),
-                lambda_regime=getattr(self.args, 'lambda_regime', 0.01),
-                lambda_jump=getattr(self.args, 'lambda_jump', 0.1),
-            )
-        else:
-            criterion = nn.MSELoss()
+        criterion = SharpeLoss()
         return criterion
+ 
 
-    # ------------------------------------------------------------------
-    # Helpers: extract the scalar prediction tensor from model output
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _get_pred_tensor(outputs):
-        """
-        The new model returns a dict when return_aux_outputs=True,
-        or a plain tensor otherwise.  Always return a tensor [B, H, C].
-        """
-        if isinstance(outputs, dict):
-            return outputs['pred']          # [B, H, C]
-        return outputs
-
-    @staticmethod
-    def _compute_loss(criterion, outputs, batch_y):
-        """
-        Route to the right loss signature depending on criterion type.
-        """
-        if isinstance(criterion, ReturnQuantFinanceLoss):
-            # The finance loss needs the full dict + target returns [B, H]
-            # batch_y is [B, pred_len, C]; squeeze the last dim if C==1
-            target = batch_y.squeeze(-1) if batch_y.shape[-1] == 1 else batch_y[..., 0]
-            loss_dict = criterion(outputs, target)
-            return loss_dict['loss']
-        else:
-            # Plain MSE path — outputs may still be a dict from another model
-            pred = Exp_Long_Term_Forecast._get_pred_tensor(outputs)
-            return criterion(pred, batch_y)
-
-    # ------------------------------------------------------------------
-    # Validation
-    # ------------------------------------------------------------------
     def vali(self, vali_data, vali_loader, criterion):
         total_loss = []
         self.model.eval()
@@ -103,37 +61,29 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 batch_x_mark = batch_x_mark.float().to(self.device)
                 batch_y_mark = batch_y_mark.float().to(self.device)
 
-                # decoder input (kept for API compatibility with encoder-decoder models)
+                # decoder input
                 dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
-                dec_inp = torch.cat(
-                    [batch_y[:, :self.args.label_len, :], dec_inp], dim=1
-                ).float().to(self.device)
-
-                # forward
+                dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
+                # encoder - decoder
                 if self.args.use_amp:
                     with torch.cuda.amp.autocast():
                         outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
                 else:
                     outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-
-                # align target slice
                 f_dim = -1 if self.args.features == 'MS' else 0
+                outputs = outputs[:, -self.args.pred_len:, f_dim:]
                 batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
 
-                # align pred slice (only needed for plain tensor path)
-                if not isinstance(outputs, dict):
-                    outputs = outputs[:, -self.args.pred_len:, f_dim:]
+                pred = outputs.detach()
+                true = batch_y.detach()
 
-                loss = self._compute_loss(criterion, outputs, batch_y)
+                loss = criterion(pred, true)
+
                 total_loss.append(loss.item())
-
         total_loss = np.average(total_loss)
         self.model.train()
         return total_loss
 
-    # ------------------------------------------------------------------
-    # Training
-    # ------------------------------------------------------------------
     def train(self, setting):
         train_data, train_loader = self._get_data(flag='train')
         vali_data, vali_loader = self._get_data(flag='val')
@@ -160,11 +110,9 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
             self.model.train()
             epoch_time = time.time()
-
             for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(train_loader):
                 iter_count += 1
                 model_optim.zero_grad()
-
                 batch_x = batch_x.float().to(self.device)
                 batch_y = batch_y.float().to(self.device)
                 batch_x_mark = batch_x_mark.float().to(self.device)
@@ -172,32 +120,29 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
                 # decoder input
                 dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
-                dec_inp = torch.cat(
-                    [batch_y[:, :self.args.label_len, :], dec_inp], dim=1
-                ).float().to(self.device)
+                dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
 
-                # forward + loss
+                # encoder - decoder
                 if self.args.use_amp:
                     with torch.cuda.amp.autocast():
                         outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+
                         f_dim = -1 if self.args.features == 'MS' else 0
-                        batch_y_slice = batch_y[:, -self.args.pred_len:, f_dim:]
-                        if not isinstance(outputs, dict):
-                            outputs = outputs[:, -self.args.pred_len:, f_dim:]
-                        loss = self._compute_loss(criterion, outputs, batch_y_slice)
+                        outputs = outputs[:, -self.args.pred_len:, f_dim:]
+                        batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
+                        loss = criterion(outputs, batch_y)
+                        train_loss.append(loss.item())
                 else:
                     outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-                    f_dim = -1 if self.args.features == 'MS' else 0
-                    batch_y_slice = batch_y[:, -self.args.pred_len:, f_dim:]
-                    if not isinstance(outputs, dict):
-                        outputs = outputs[:, -self.args.pred_len:, f_dim:]
-                    loss = self._compute_loss(criterion, outputs, batch_y_slice)
 
-                train_loss.append(loss.item())
+                    f_dim = -1 if self.args.features == 'MS' else 0
+                    outputs = outputs[:, -self.args.pred_len:, f_dim:]
+                    batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
+                    loss = criterion(outputs, batch_y)
+                    train_loss.append(loss.item())
 
                 if (i + 1) % 100 == 0:
-                    print("\titers: {0}, epoch: {1} | loss: {2:.7f}".format(
-                        i + 1, epoch + 1, loss.item()))
+                    print("\titers: {0}, epoch: {1} | loss: {2:.7f}".format(i + 1, epoch + 1, loss.item()))
                     speed = (time.time() - time_now) / iter_count
                     left_time = speed * ((self.args.train_epochs - epoch) * train_steps - i)
                     print('\tspeed: {:.4f}s/iter; left time: {:.4f}s'.format(speed, left_time))
@@ -231,16 +176,11 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
         return self.model
 
-    # ------------------------------------------------------------------
-    # Test
-    # ------------------------------------------------------------------
     def test(self, setting, test=0):
         test_data, test_loader = self._get_data(flag='test')
         if test:
             print('loading model')
-            self.model.load_state_dict(
-                torch.load(os.path.join('./checkpoints/' + setting, 'checkpoint.pth'))
-            )
+            self.model.load_state_dict(torch.load(os.path.join('./checkpoints/' + setting, 'checkpoint.pth')))
 
         preds = []
         trues = []
@@ -248,73 +188,53 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         if not os.path.exists(folder_path):
             os.makedirs(folder_path)
 
-        # During test we only need the point-prediction tensor, not the full dict.
-        # Temporarily disable aux outputs so forward() returns a plain tensor.
-        _model = self.model.module if hasattr(self.model, 'module') else self.model
-        _orig_aux = _model.return_aux_outputs
-        _model.return_aux_outputs = False
-
         self.model.eval()
         with torch.no_grad():
             for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(test_loader):
                 batch_x = batch_x.float().to(self.device)
                 batch_y = batch_y.float().to(self.device)
+
                 batch_x_mark = batch_x_mark.float().to(self.device)
                 batch_y_mark = batch_y_mark.float().to(self.device)
 
                 # decoder input
                 dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
-                dec_inp = torch.cat(
-                    [batch_y[:, :self.args.label_len, :], dec_inp], dim=1
-                ).float().to(self.device)
-
+                dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
+                # encoder - decoder
                 if self.args.use_amp:
                     with torch.cuda.amp.autocast():
                         outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
                 else:
                     outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
 
-                # outputs is a plain tensor here [B, H, C]
                 f_dim = -1 if self.args.features == 'MS' else 0
                 outputs = outputs[:, -self.args.pred_len:, :]
                 batch_y = batch_y[:, -self.args.pred_len:, :].to(self.device)
-
                 outputs = outputs.detach().cpu().numpy()
                 batch_y = batch_y.detach().cpu().numpy()
-
                 if test_data.scale and self.args.inverse:
                     shape = batch_y.shape
                     if outputs.shape[-1] != batch_y.shape[-1]:
-                        outputs = np.tile(
-                            outputs,
-                            [1, 1, int(batch_y.shape[-1] / outputs.shape[-1])]
-                        )
-                    outputs = test_data.inverse_transform(
-                        outputs.reshape(shape[0] * shape[1], -1)
-                    ).reshape(shape)
-                    batch_y = test_data.inverse_transform(
-                        batch_y.reshape(shape[0] * shape[1], -1)
-                    ).reshape(shape)
+                        outputs = np.tile(outputs, [1, 1, int(batch_y.shape[-1] / outputs.shape[-1])])
+                    outputs = test_data.inverse_transform(outputs.reshape(shape[0] * shape[1], -1)).reshape(shape)
+                    batch_y = test_data.inverse_transform(batch_y.reshape(shape[0] * shape[1], -1)).reshape(shape)
 
                 outputs = outputs[:, :, f_dim:]
                 batch_y = batch_y[:, :, f_dim:]
 
-                preds.append(outputs)
-                trues.append(batch_y)
+                pred = outputs
+                true = batch_y
 
+                preds.append(pred)
+                trues.append(true)
                 if i % 20 == 0:
                     input = batch_x.detach().cpu().numpy()
                     if test_data.scale and self.args.inverse:
                         shape = input.shape
-                        input = test_data.inverse_transform(
-                            input.reshape(shape[0] * shape[1], -1)
-                        ).reshape(shape)
-                    gt = np.concatenate((input[0, :, -1], batch_y[0, :, -1]), axis=0)
-                    pd = np.concatenate((input[0, :, -1], outputs[0, :, -1]), axis=0)
+                        input = test_data.inverse_transform(input.reshape(shape[0] * shape[1], -1)).reshape(shape)
+                    gt = np.concatenate((input[0, :, -1], true[0, :, -1]), axis=0)
+                    pd = np.concatenate((input[0, :, -1], pred[0, :, -1]), axis=0)
                     visual(gt, pd, os.path.join(folder_path, str(i) + '.pdf'))
-
-        # Restore aux-output flag
-        _model.return_aux_outputs = _orig_aux
 
         preds = np.concatenate(preds, axis=0)
         trues = np.concatenate(trues, axis=0)

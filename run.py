@@ -157,48 +157,35 @@ if __name__ == '__main__':
     parser.add_argument('--pos', type=int, choices=[0, 1], default=1, help='Positional Embedding. Set pos to 0 or 1')
 
     # ---- VAMPM ----
-    parser.add_argument('--patch_lens', type=int, nargs='+', default=[8, 16, 32], help='multi-scale patch lengths')
-    parser.add_argument('--patch_stride_ratio', type=float, default=0.5, help='patch stride ratio')
-    parser.add_argument('--se_reduction', type=int, default=4, help='reduction ratio for fusion gating')
-    parser.add_argument('--d_state', type=int, default=64, help='state dimension for Mamba-like branch')
+    parser.add_argument('--patch_lens', type=int, nargs='+', default=[8, 16, 32],
+                        help='multi-scale patch lengths, e.g. --patch_lens 8 16 32')
 
-    parser.add_argument('--n_regimes', type=int, default=4, help='number of latent market regimes')
-    parser.add_argument('--n_quantiles', type=int, default=3, help='number of quantiles predicted')
+    parser.add_argument('--patch_stride_mode', type=str, default='half',
+                        choices=['half', 'fixed'],
+                        help="stride computation: 'half' => patch_len//2, 'fixed' => use --patch_stride")
 
-    parser.add_argument('--target_index', type=int, default=0, help='index of target return column in encoder input')
-    parser.add_argument('--use_revin', action='store_true', help='use RevIN normalization')
-    parser.add_argument('--use_time_marks', action='store_true', help='use temporal mark features')
-    parser.add_argument('--time_dim', type=int, default=0, help='number of temporal mark dimensions')
-    parser.add_argument('--return_aux_outputs', action='store_true', help='return auxiliary outputs as dict')
+    parser.add_argument('--patch_stride', type=int, default=None,
+                        help='used only when patch_stride_mode=fixed')
 
-    # =========================
-    # Quantile / loss params
-    # =========================
-    parser.add_argument('--quantiles', type=float, nargs='+', default=[0.1, 0.5, 0.9], help='quantiles for probabilistic forecasting')
-    parser.add_argument('--lambda_return', type=float, default=1.0, help='weight for return loss')
-    parser.add_argument('--lambda_direction', type=float, default=0.3, help='weight for direction loss')
-    parser.add_argument('--lambda_vol', type=float, default=0.2, help='weight for volatility loss')
-    parser.add_argument('--lambda_quantile', type=float, default=0.3, help='weight for quantile loss')
-    parser.add_argument('--lambda_regime', type=float, default=0.01, help='weight for regime entropy regularization')
-    parser.add_argument('--lambda_jump', type=float, default=0.1, help='weight for jump classification loss')
+    parser.add_argument('--patch_padding_mode', type=str, default='stride',
+                        choices=['stride', 'fixed'],
+                        help="padding computation: 'stride' => padding=stride, 'fixed' => use --patch_padding")
 
-    # =========================
-    # Dataset split ratios
-    # =========================
-    parser.add_argument('--train_ratio', type=float, default=0.7, help='train set ratio')
-    parser.add_argument('--val_ratio', type=float, default=0.1, help='validation set ratio')
-    parser.add_argument('--test_ratio', type=float, default=0.2, help='test set ratio')
+    parser.add_argument('--patch_padding', type=int, default=None,
+                        help='used only when patch_padding_mode=fixed')
 
-    # =========================
-    # Optional trading params
-    # =========================
-    parser.add_argument('--use_trading', action='store_true', help='run trading simulation after test')
-    parser.add_argument('--trade_balance', type=float, default=100.0, help='initial trading balance')
-    parser.add_argument('--trade_mode', type=str, default='smart', help='trading mode')
-    parser.add_argument('--trade_risk', type=float, default=5.0, help='risk allocation parameter')
-    parser.add_argument('--trade_tr', type=float, default=0.01, help='trading threshold')
-    parser.add_argument('--trade_fee_bps', type=float, default=0.0, help='transaction fee in basis points')
-    parser.add_argument('--trade_max_short', type=float, default=0.002, help='maximum short exposure')
+    parser.add_argument('--patch_num_bias', type=int, default=2,
+                        help="bias used in patch num formula: int((seq_len - p)/s + bias). Your code uses +2 by default.")
+
+    # ---- Scale gating  ----
+    parser.add_argument('--use_scale_gating', type=int, default=1,
+                        help='1: enable VolatilityAwareScaleGatingSE per scale, 0: disable')
+
+    parser.add_argument('--se_reduction', type=int, default=4,
+                        help='reduction ratio inside VolatilityAwareScaleGatingSE')
+
+    parser.add_argument('--se_dropout', type=float, default=0.1,
+                        help='dropout inside VolatilityAwareScaleGatingSE gate MLP')
     args = parser.parse_args()
     if torch.cuda.is_available() and args.use_gpu:
         args.device = torch.device('cuda:{}'.format(args.gpu))
