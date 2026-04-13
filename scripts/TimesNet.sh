@@ -6,12 +6,12 @@ model_name="TimesNet"
 
 ROOT_PATH="./datasets/crypto"
 DATA_NAME="custom"
-TARGET="return"
+TARGET="target_log_return_7d"
 
 FEATURES="MS"
-ENC_IN=28
-DEC_IN=28
-C_OUT=28
+ENC_IN=144
+DEC_IN=144
+C_OUT=144
 
 
 SEQ_LEN=32
@@ -25,7 +25,7 @@ SYMBOLS=("BTC-USD")
 echo "Start training loops for ${model_name}"
 
 for sym in "${SYMBOLS[@]}"; do
-  DATA_PATH="final_dataset.csv"
+  DATA_PATH="processed_crypto_metric_7d_tslib.csv"
 
   for PRED_LEN in "${PRED_LENS[@]}"; do
     MODEL_ID="${sym}_${INTERVAL_TAG}_${SEQ_LEN}_${PRED_LEN}_${model_name}_${FEATURES}"
@@ -36,7 +36,7 @@ for sym in "${SYMBOLS[@]}"; do
     echo "MODEL_ID=${MODEL_ID}"
     echo "============================================================"
 
-    python -u run.py \
+    uv run run.py \
       --task_name long_term_forecast \
       --is_training 1 \
       --root_path "${ROOT_PATH}/" \
